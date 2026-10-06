@@ -28,6 +28,7 @@ import { useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectStandards } from '@/stores/standardSlice';
 import {
   DB_NAME,
   DB_VERSION,
@@ -42,6 +43,7 @@ import {
   buildArraySummaries,
   buildBackupPayload,
   countPayload,
+  effectQualifyStats,
   exportBackupJson,
   importBackup,
   readFileText,
@@ -52,7 +54,14 @@ import {
 } from '@/utils/export';
 import { bearingDeg, round, stationDistances, toLocalPlane, planeViewBox } from '@/utils/geo';
 
-const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0 };
+const EMPTY_COUNTS: CountMap = {
+  arrays: 0,
+  stations: 0,
+  instruments: 0,
+  calibrations: 0,
+  replaces: 0,
+  standards: 0,
+};
 
 export default function GeometryView() {
   const { message } = AntdApp.useApp();
@@ -62,6 +71,7 @@ export default function GeometryView() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const standards = useAppSelector(selectStandards);
 
   const [selectedArrayId, setSelectedArrayId] = useState<string | null>(null);
   const [counts, setCounts] = useState<CountMap>(EMPTY_COUNTS);
@@ -86,7 +96,7 @@ export default function GeometryView() {
   useEffect(() => {
     void refresh();
     // 数据变化后刷新统计
-  }, [arrays, stations, instruments, calibrations, replaces]);
+  }, [arrays, stations, instruments, calibrations, replaces, standards]);
 
   const activeArrayId = selectedArrayId ?? arrays[0]?.id ?? null;
   const activeArray = arrays.find((row) => row.id === activeArrayId) ?? null;
@@ -106,9 +116,13 @@ export default function GeometryView() {
       instruments,
       calibrations,
       replaces,
+      standards,
     };
     return buildArraySummaries(payload);
-  }, [arrays, calibrations, instruments, replaces, stations]);
+  }, [arrays, calibrations, instruments, replaces, standards, stations]);
+
+  /** 全库生效口径合格率（导出与顶部说明用） */
+  const globalEffect = useMemo(() => effectQualifyStats(calibrations), [calibrations]);
 
   const activeSummary = summaries.find((row) => row.arrayId === activeArrayId) ?? null;
 
@@ -233,7 +247,7 @@ export default function GeometryView() {
     const text = summaries
       .map(
         (row) =>
-          `${row.arrayName}（${row.state} / ${row.department}）：台站 ${row.stationCount} 个，仪器 ${row.instrumentCount} 台，登记孔径 ${row.recordedApertureKm} km，实算孔径 ${row.computedApertureKm} km，平均台间距 ${row.meanSpacingKm} km，累计标定 ${row.calibrationCount} 次，不合格 ${row.unqualifiedCount} 次，超期 ${row.overdueCount} 台，未闭环更换 ${row.pendingReplaceCount} 条。`
+          `${row.arrayName}（${row.state} / ${row.department}）：台站 ${row.stationCount} 个，仪器 ${row.instrumentCount} 台，登记孔径 ${row.recordedApertureKm} km，实算孔径 ${row.computedApertureKm} km，平均台间距 ${row.meanSpacingKm} km，累计标定 ${row.calibrationCount} 次，生效合格率 ${row.qualifyRate}%，生效不合格 ${row.unqualifiedCount} 次，待重算 ${row.pendingEffectCount} 份，超期 ${row.overdueCount} 台，未闭环更换 ${row.pendingReplaceCount} 条。`
       )
       .join('\n');
     try {
@@ -284,6 +298,15 @@ export default function GeometryView() {
         <StatBadge label="仪器" value={counts.instruments} suffix="台" tone="default" />
         <StatBadge label="标定记录" value={counts.calibrations} suffix="次" tone="success" />
         <StatBadge label="更换记录" value={counts.replaces} suffix="条" tone="warning" />
+        <StatBadge label="标准器" value={counts.standards} suffix="台" tone="info"
+          tip="计量站标准器台账（含溯源证书），随快照导出" />
+        <StatBadge
+          label="生效合格率"
+          value={globalEffect.rate}
+          percent={globalEffect.rate}
+          tone="success"
+          tip={`生效合格 ${globalEffect.qualified} / 可用 ${globalEffect.usable}，待重算 ${globalEffect.pending} 份单列`}
+        />
       </div>
 
       {!activeArray || !activeSummary ? (
@@ -379,11 +402,14 @@ export default function GeometryView() {
                       )}° 方位至首站）`
                     : '—'}
                 </Descriptions.Item>
-                <Descriptions.Item label="累计标定 / 不合格">
+                <Descriptions.Item label="累计标定 / 生效不合格">
                   {activeSummary.calibrationCount} 次 /{' '}
                   <span className={activeSummary.unqualifiedCount > 0 ? 'gb-danger' : ''}>
                     {activeSummary.unqualifiedCount} 次
                   </span>
+                </Descriptions.Item>
+                <Descriptions.Item label="生效合格率 / 待重算">
+                  <b>{activeSummary.qualifyRate}%</b> / {activeSummary.pendingEffectCount} 份（未计入合格率）
                 </Descriptions.Item>
                 <Descriptions.Item label="超期未标定 / 未闭环更换">
                   {activeSummary.overdueCount} 台 / {activeSummary.pendingReplaceCount} 条
@@ -449,13 +475,27 @@ export default function GeometryView() {
               align: 'right',
               className: 'gb-mono',
             },
-            { title: '累计标定', dataIndex: 'calibrationCount', width: 100, align: 'right', className: 'gb-mono' },
+            { title: '累计标定', dataIndex: 'calibrationCount', width: 90, align: 'right', className: 'gb-mono' },
             {
-              title: '不合格',
+              title: '生效合格率',
+              dataIndex: 'qualifyRate',
+              width: 100,
+              align: 'right',
+              render: (value: number) => <b className="gb-mono">{value}%</b>,
+            },
+            {
+              title: '生效不合格',
               dataIndex: 'unqualifiedCount',
               width: 90,
               align: 'right',
               render: (value: number) => <span className={value > 0 ? 'gb-danger gb-mono' : 'gb-mono'}>{value}</span>,
+            },
+            {
+              title: '待重算',
+              dataIndex: 'pendingEffectCount',
+              width: 80,
+              align: 'right',
+              render: (value: number) => <span className={value > 0 ? 'gb-warning gb-mono' : 'gb-mono'}>{value}</span>,
             },
             {
               title: '超期台数',
@@ -504,14 +544,15 @@ export default function GeometryView() {
             <Descriptions.Item label="浏览器记录版本">v{stampedVersion}</Descriptions.Item>
             <Descriptions.Item label="台阵 / 台站">{counts.arrays} / {counts.stations}</Descriptions.Item>
             <Descriptions.Item label="仪器 / 标定">{counts.instruments} / {counts.calibrations}</Descriptions.Item>
-            <Descriptions.Item label="更换记录">{counts.replaces}</Descriptions.Item>
+            <Descriptions.Item label="更换 / 标准器">{counts.replaces} / {counts.standards}</Descriptions.Item>
             <Descriptions.Item label="最近备份时间" span={3}>
               {lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份'}
             </Descriptions.Item>
           </Descriptions>
           <p className="gb-hint">
             数据仅保存在当前浏览器 IndexedDB（{DB_NAME}）中，换浏览器或清空站点数据后不会自动跟随，请通过 JSON
-            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces 五张表。
+            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces / standards 六张表，
+            标定含原始读数与生效值、判定依据及所挂标准器/证书号。
           </p>
         </Space>
       </Card>

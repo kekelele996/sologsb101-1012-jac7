@@ -10,10 +10,50 @@ import type {
   ResponseVerdict,
 } from '@/types/calibration';
 import { createEmptyCalibrationFilter, judgeCalibration, sensitivityDelta } from '@/types/calibration';
+import { recomputeCalibrationEffect } from '@/utils/traceability';
+import { recomputeOne, attachStandardAndRecompute } from '@/utils/recompute';
 import type { Replace, ReplaceFilterState, ReplaceState } from '@/types/replace';
 import { canTransition, createEmptyReplaceFilter } from '@/types/replace';
 import type { Instrument } from '@/types/instrument';
+import type { CalibrationStandard } from '@/types/standard';
 import type { RootState } from '@/stores/store';
+
+/** 新建/编辑标定表单提交字段（含挂接的计量标准器） */
+export type CalibrationInput = Omit<
+  Calibration,
+  | 'id'
+  | 'createdAt'
+  | 'updatedAt'
+  | 'responseVerdict'
+  | 'standardSerialNo'
+  | 'traceCertNo'
+  | 'effectiveSensitivity'
+  | 'effectiveSelfNoise'
+  | 'effectiveVerdict'
+  | 'effectStatus'
+  | 'effectBasis'
+  | 'recompute'
+> & { responseVerdict?: ResponseVerdict };
+
+/** 按标准器折算生效值并补齐挂接冗余字段 */
+function withEffect(
+  row: Calibration,
+  instrument: Instrument | undefined,
+  standard: CalibrationStandard | undefined
+): Calibration {
+  const effect = recomputeCalibrationEffect(row, standard ?? null, instrument?.type ?? '宽频带', Date.now());
+  return {
+    ...row,
+    effectiveSensitivity: effect.effectiveSensitivity,
+    effectiveSelfNoise: effect.effectiveSelfNoise,
+    effectiveVerdict: effect.effectiveVerdict,
+    effectStatus: effect.status,
+    effectBasis: effect.basis,
+    recompute: effect.recompute,
+    standardSerialNo: effect.basis?.standardSerialNo ?? standard?.serialNo ?? '',
+    traceCertNo: effect.basis?.certNo ?? '',
+  };
+}
 
 /** 选择器入参统一用 RootState */
 type WithCalibration = RootState;
@@ -43,7 +83,7 @@ const initialState: CalibrationSliceState = {
 
 export const createCalibration = createAsyncThunk(
   'calibration/createCalibration',
-  async (payload: Omit<Calibration, 'id' | 'createdAt' | 'updatedAt' | 'responseVerdict'>) => {
+  async (payload: CalibrationInput) => {
     const now = Date.now();
     const instrument = await db.instruments.get(payload.instrumentId);
     const verdict = judgeCalibration(
@@ -51,20 +91,30 @@ export const createCalibration = createAsyncThunk(
       payload.sensitivity,
       payload.selfNoise
     );
-    const row: Calibration = {
+    const standard = payload.standardId ? await db.standards.get(payload.standardId) : undefined;
+    const base: Calibration = {
       ...payload,
-      responseVerdict: verdict,
+      responseVerdict: payload.responseVerdict ?? verdict,
       id: createId('cal'),
+      standardSerialNo: '',
+      traceCertNo: '',
+      effectiveSensitivity: null,
+      effectiveSelfNoise: null,
+      effectiveVerdict: '待判定',
+      effectStatus: '待重算',
+      effectBasis: null,
+      recompute: null,
       createdAt: now,
       updatedAt: now,
     };
+    const row = withEffect(base, instrument, standard);
     await db.calibrations.put(row);
-    // 标定完成后按结论回写仪器状态
+    // 标定完成后按“生效结论”回写仪器状态（待重算 / 重算失败不视作合格）
     if (instrument) {
-      await db.instruments.update(instrument.id, {
-        state: verdict === '不合格' ? '待标定' : '在用',
-        updatedAt: now,
-      } as never);
+      const effectiveOk = row.effectStatus === '原值有效' || row.effectStatus === '已折算';
+      const state =
+        !effectiveOk || row.effectiveVerdict === '不合格' ? '待标定' : '在用';
+      await db.instruments.update(instrument.id, { state, updatedAt: now } as never);
     }
     return row;
   }
@@ -72,18 +122,56 @@ export const createCalibration = createAsyncThunk(
 
 export const updateCalibration = createAsyncThunk(
   'calibration/updateCalibration',
-  async (payload: { id: string; patch: Partial<Calibration> }) => {
+  async (payload: { id: string; patch: Partial<CalibrationInput> }) => {
     const existing = await db.calibrations.get(payload.id);
-    const instrument = existing ? await db.instruments.get(existing.instrumentId) : undefined;
-    const nextSensitivity = payload.patch.sensitivity ?? existing?.sensitivity ?? 0;
-    const nextNoise = payload.patch.selfNoise ?? existing?.selfNoise ?? 0;
-    const verdict = judgeCalibration(instrument?.type ?? '宽频带', nextSensitivity, nextNoise);
-    await db.calibrations.update(payload.id, {
+    if (!existing) return payload;
+    const instrument = await db.instruments.get(existing.instrumentId);
+    const nextSensitivity = payload.patch.sensitivity ?? existing.sensitivity;
+    const nextNoise = payload.patch.selfNoise ?? existing.selfNoise;
+    const autoVerdict = judgeCalibration(instrument?.type ?? '宽频带', nextSensitivity, nextNoise);
+
+    const standardId = payload.patch.standardId ?? existing.standardId;
+    const standard = standardId ? await db.standards.get(standardId) : undefined;
+
+    const merged: Calibration = {
+      ...existing,
       ...payload.patch,
-      responseVerdict: payload.patch.responseVerdict ?? verdict,
+      responseVerdict: payload.patch.responseVerdict ?? existing.responseVerdict ?? autoVerdict,
+      standardId,
       updatedAt: Date.now(),
-    } as never);
+    };
+    const row = withEffect(merged, instrument, standard);
+    await db.calibrations.put(row);
     return payload;
+  }
+);
+
+/**
+ * 台网中心重出失败后“只重试这份”：重算单份生效值。
+ * 只读标准器台账，无论成功失败都不改动 standards 表。
+ */
+export const retryCalibrationEffect = createAsyncThunk(
+  'calibration/retryCalibrationEffect',
+  async (calibrationId: string, { rejectWithValue }) => {
+    try {
+      const row = await recomputeOne(calibrationId);
+      return { id: calibrationId, status: row.effectStatus, error: row.recompute?.lastError ?? '' };
+    } catch (error) {
+      return rejectWithValue(error instanceof Error ? error.message : '重算失败');
+    }
+  }
+);
+
+/** 旧数据补挂标准器后，让这批“补不出先单列”的结论重算 */
+export const attachStandards = createAsyncThunk(
+  'calibration/attachStandards',
+  async (payload: { calibrationIds: string[]; standardId: string }, { rejectWithValue }) => {
+    try {
+      const count = await attachStandardAndRecompute(payload.calibrationIds, payload.standardId);
+      return { count };
+    } catch (error) {
+      return rejectWithValue(error instanceof Error ? error.message : '补挂失败');
+    }
   }
 );
 
@@ -100,11 +188,16 @@ export const bulkSetVerdict = createAsyncThunk(
   'calibration/bulkSetVerdict',
   async (payload: { ids: string[]; verdict: ResponseVerdict }) => {
     const now = Date.now();
+    // 原始结论留档可批量订正；生效口径中“已折算/原值有效”的份同步采用人工结论，
+    // 待重算/重算失败的份仍单列，不因此变成合格。
     await db.calibrations
       .where('id')
       .anyOf(payload.ids)
       .modify((row) => {
         row.responseVerdict = payload.verdict;
+        if (row.effectStatus === '原值有效' || row.effectStatus === '已折算') {
+          row.effectiveVerdict = payload.verdict;
+        }
         row.updatedAt = now;
       });
     return payload;
@@ -216,6 +309,15 @@ const calibrationSlice = createSlice({
       })
       .addCase(transitionReplace.rejected, (state, action) => {
         state.error = typeof action.payload === 'string' ? action.payload : '更换状态流转失败';
+      })
+      .addCase(retryCalibrationEffect.fulfilled, (state, action) => {
+        state.lastReceipt =
+          action.payload.status === '重算失败' || action.payload.status === '待重算'
+            ? `这份结论仍为「${action.payload.status}」：${action.payload.error}（标准器台账未改动，可继续重试这一份）`
+            : `这份结论已重算为「${action.payload.status}」，合格率与更换提醒已按生效口径刷新`;
+      })
+      .addCase(attachStandards.fulfilled, (state, action) => {
+        state.lastReceipt = `已为 ${action.payload.count} 份旧结论补挂标准器并重算生效值`;
       });
   },
 });
@@ -302,5 +404,11 @@ export const selectSensitivityDeltas = (
   });
   return result;
 };
+
+/** 需要台网中心处理（待重算 / 重算失败）的标定：单列、不进合格率与更换口径 */
+export const selectCalibrationsNeedingAttention = (state: WithCalibration): Calibration[] =>
+  state.calibration.calibrations.filter(
+    (row) => row.effectStatus === '待重算' || row.effectStatus === '重算失败'
+  );
 
 export default calibrationSlice.reducer;

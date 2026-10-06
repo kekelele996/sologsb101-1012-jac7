@@ -12,9 +12,11 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { CalibrationStandard } from '@/types/standard';
+import { pickStandardAtDate, recomputeCalibrationEffect } from '@/utils/traceability';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -36,6 +38,7 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  standards: CalibrationStandard[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +47,8 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  /** 计量站标准器台账（含溯源证书） */
+  standards!: Table<CalibrationStandard, string>;
 
   constructor() {
     super(DB_NAME);
@@ -58,34 +63,69 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
+    this.version(2).stores({
+      arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+      stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+      instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+      calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+      replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+    });
+
+    // v3：计量溯源域——新增 standards 表；标定挂标准器并按生效口径索引
     this.version(DB_VERSION)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
         instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
-        calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+        calibrations:
+          'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, standardId, standardSerialNo, traceCertNo, effectStatus, effectiveVerdict, updatedAt',
         replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+        standards: 'id, name, model, serialNo, state, ownerAgency, updatedAt',
       })
       .upgrade(async (tx) => {
-        // 迁移：历史数据补齐时间戳与必填字段，避免列表排序与筛选拿到 undefined
-        const defaults: Array<[string, () => Record<string, unknown>]> = [
-          ['arrays', () => ({ apertureKm: 0, stationCount: 0, department: '' })],
-          ['stations', () => ({ lat: 0, lng: 0, elevM: 0, bedrock: '花岗岩', siteNote: '' })],
-          ['instruments', () => ({ type: '宽频带', model: '', state: '在用', remark: '' })],
-          ['calibrations', () => ({ sensitivity: 0, selfNoise: 0, responseVerdict: '待判定', agency: '' })],
-          ['replaces', () => ({ state: '待更换', newSerialNo: '', operator: '' })],
-        ];
-        for (const [tableName, factory] of defaults) {
-          await tx
-            .table(tableName)
-            .toCollection()
-            .modify((row: Record<string, unknown>) => {
-              const now = Date.now();
-              if (typeof row.createdAt !== 'number') row.createdAt = now;
-              if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt;
-              Object.assign(row, factory());
-            });
-        }
+        // v2 → v3：旧标定缺标准器号，按标定日期补“当时在用”的那台；补不出先单列（待重算）。
+        const standards = await tx.table<CalibrationStandard, string>('standards').toArray();
+        const instruments = await tx.table<Instrument, string>('instruments').toArray();
+        const instrumentType = new Map(instruments.map((row) => [row.id, row.type]));
+
+        await tx
+          .table<Calibration, string>('calibrations')
+          .toCollection()
+          .modify((row) => {
+            const now = Date.now();
+            const type = instrumentType.get(row.instrumentId) ?? '宽频带';
+
+            // 历史行可能连 v2 默认字段都缺，先兜底
+            if (typeof row.sensitivity !== 'number') row.sensitivity = 0;
+            if (typeof row.selfNoise !== 'number') row.selfNoise = 0;
+            if (!row.responseVerdict) row.responseVerdict = '待判定';
+            if (typeof row.agency !== 'string') row.agency = '';
+
+            if (typeof row.standardId !== 'string') {
+              const matched = standards.length > 0 ? pickStandardAtDate(standards, row.date, type) : null;
+              row.standardId = matched?.id ?? '';
+              row.standardSerialNo = matched?.serialNo ?? '';
+              row.traceCertNo = '';
+            }
+            if (row.effectiveSensitivity === undefined) row.effectiveSensitivity = null;
+            if (row.effectiveSelfNoise === undefined) row.effectiveSelfNoise = null;
+            if (!row.effectiveVerdict) row.effectiveVerdict = '待判定';
+            if (!row.effectStatus) {
+              // 迁移此刻不做整库折算（避免在升级事务里跑重逻辑）：先标记，由打开后的重算任务按份补算
+              row.effectStatus = row.standardId ? '原值有效' : '待重算';
+            }
+            if (row.effectBasis === undefined) row.effectBasis = null;
+            if (row.recompute === undefined) {
+              row.recompute = row.standardId
+                ? null
+                : {
+                    status: '待重算' as const,
+                    recomputedAt: now,
+                    lastError: '旧数据未记标准器号，升级时按标定日期补不到当时在用的标准器，先单列待补挂',
+                    attempts: 0,
+                  };
+            }
+          });
       });
   }
 }
@@ -385,6 +425,17 @@ export async function seedDemoData(): Promise<void> {
                   agency: '国家测震台网计量中心',
                   remark: '变化 0.97%，合格',
                 },
+                {
+                  // 最近一次标定晚于最新证书有效期（2025-07-01）：标准器已过期，原值留档、按 0.995 折算
+                  id: 'cal_hx01_bb_3',
+                  instrumentId: 'ins_hx01_bb',
+                  date: daysAgo(40),
+                  sensitivity: 1510.0,
+                  selfNoise: 2.3,
+                  operator: '陈立群',
+                  agency: '国家测震台网计量中心',
+                  remark: '标准器超期未送检，结论按最近证书折算生效值',
+                },
               ],
             },
             {
@@ -449,6 +500,115 @@ export async function seedDemoData(): Promise<void> {
     },
   ];
 
+  /* ------------------ 计量站标准器（含溯源证书；含“已过期”样本以演示折算口径） ------------------ */
+
+  const standards: CalibrationStandard[] = [
+    {
+      id: 'std_prov_bb',
+      name: '便携式地震计校准装置',
+      model: 'GSB-2100',
+      serialNo: 'GSB2100-省级-07',
+      ownerAgency: '省地震局计量站',
+      scopeTypes: ['宽频带', '短周期'],
+      inUseFrom: '2020-01-01',
+      inUseUntil: '',
+      state: '在役',
+      remark: '省级现场比对主用标准器',
+      certificates: [
+        {
+          certNo: 'JL-2021-0318',
+          issuedBy: '国家地震计量站',
+          confirmDate: '2021-03-18',
+          validFrom: '2021-03-18',
+          validUntil: '2023-03-17',
+          correctionFactor: 1.0,
+          uncertaintyPct: 0.8,
+          remark: '首轮溯源',
+        },
+        {
+          // 刻意留出 2023-03-18 ~ 2024-03-19 的“空窗期”，落在该窗口的标定走「已折算」
+          certNo: 'JL-2024-0320',
+          issuedBy: '国家地震计量站',
+          confirmDate: '2024-03-20',
+          validFrom: '2024-03-20',
+          validUntil: '2026-03-19',
+          correctionFactor: 1.012,
+          uncertaintyPct: 0.7,
+          remark: '给出灵敏度修正因子 1.012',
+        },
+      ],
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: 'std_natl_bb',
+      name: '宽频带地震计校准标准装置',
+      model: 'GSB-N3000',
+      serialNo: 'GSBN3000-国家-02',
+      ownerAgency: '国家测震台网计量中心',
+      scopeTypes: ['宽频带', '强震'],
+      inUseFrom: '2018-06-01',
+      inUseUntil: '',
+      state: '在役',
+      remark: '国家台网中心比对面值标准',
+      certificates: [
+        {
+          certNo: 'GS-2022-1107',
+          issuedBy: '中国计量科学研究院',
+          confirmDate: '2022-11-07',
+          validFrom: '2022-11-07',
+          validUntil: '2024-06-30',
+          correctionFactor: 1.0,
+          uncertaintyPct: 0.5,
+          remark: '',
+        },
+        {
+          // 最近证书有效期已过且无更新：演示“标准器一过期，比过的结论按新口径重算”
+          certNo: 'GS-2024-0702',
+          issuedBy: '中国计量科学研究院',
+          confirmDate: '2024-07-02',
+          validFrom: '2024-07-02',
+          validUntil: '2025-07-01',
+          correctionFactor: 0.995,
+          uncertaintyPct: 0.5,
+          remark: '最新校准已过期，待送检；历史结论按 0.995 折算留档',
+        },
+      ],
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: 'std_old_st',
+      name: '短周期地震计校准器（已停用）',
+      model: 'GSB-900',
+      serialNo: 'GSB900-省级-01',
+      ownerAgency: '省地震局计量站',
+      scopeTypes: ['短周期'],
+      inUseFrom: '2015-01-01',
+      inUseUntil: '2022-12-31',
+      state: '停用',
+      remark: '2022 年底退役；保留台账仅供历史结论追溯',
+      certificates: [
+        {
+          certNo: 'JL-2020-0512',
+          issuedBy: '国家地震计量站',
+          confirmDate: '2020-05-12',
+          validFrom: '2020-05-12',
+          validUntil: '2022-05-11',
+          correctionFactor: 1.0,
+          uncertaintyPct: 1.2,
+          remark: '退役前最后一次溯源',
+        },
+      ],
+      createdAt: now,
+      updatedAt: now,
+    },
+  ];
+
+  /** 按标定机构选“当时那台”标准器 */
+  const standardByAgency = (agency: string): CalibrationStandard =>
+    agency.includes('国家') ? standards[1] : standards[0];
+
   const replaces: Replace[] = [
     {
       id: 'rpl_ltx02_st',
@@ -490,7 +650,7 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.standards],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -520,9 +680,56 @@ export async function seedDemoData(): Promise<void> {
                 calibrationSeed.sensitivity,
                 calibrationSeed.selfNoise
               );
+
+              // 旧数据没记标准器号的样本（2022 年短周期备份仪器首标）：演示“补不出先单列”
+              const isLegacyUnlinked = calibrationSeed.id === 'cal_ltx01_st_1';
+              const standard = isLegacyUnlinked ? null : standardByAgency(calibrationSeed.agency);
+              const effect = recomputeCalibrationEffect(
+                {
+                  id: calibrationSeed.id,
+                  instrumentId: calibrationSeed.instrumentId,
+                  date: calibrationSeed.date,
+                  sensitivity: calibrationSeed.sensitivity,
+                  selfNoise: calibrationSeed.selfNoise,
+                  responseVerdict: verdict,
+                  operator: calibrationSeed.operator,
+                  agency: calibrationSeed.agency,
+                  remark: calibrationSeed.remark,
+                  standardId: standard?.id ?? '',
+                  standardSerialNo: standard?.serialNo ?? '',
+                  traceCertNo: '',
+                  effectiveSensitivity: null,
+                  effectiveSelfNoise: null,
+                  effectiveVerdict: '待判定',
+                  effectStatus: '待重算',
+                  effectBasis: null,
+                  recompute: null,
+                  ...stamp(0),
+                },
+                standard,
+                instrumentRest.type,
+                now
+              );
+
               calibrationRows.push({
                 ...calibrationSeed,
                 responseVerdict: verdict,
+                standardId: standard?.id ?? '',
+                standardSerialNo: standard?.serialNo ?? '',
+                traceCertNo: effect.basis?.certNo ?? '',
+                effectiveSensitivity: effect.effectiveSensitivity,
+                effectiveSelfNoise: effect.effectiveSelfNoise,
+                effectiveVerdict: effect.effectiveVerdict,
+                effectStatus: effect.status,
+                effectBasis: effect.basis,
+                recompute: isLegacyUnlinked
+                  ? {
+                      status: '待重算',
+                      recomputedAt: now,
+                      lastError: '旧数据未记标准器号，升级时按标定日期补不到当时在用的标准器，先单列待补挂',
+                      attempts: 0,
+                    }
+                  : effect.recompute,
                 ...stamp(
                   400 + arrayIndex * 400 + stationIndex * 100 + instrumentIndex * 20 + calibrationIndex
                 ),
@@ -532,6 +739,7 @@ export async function seedDemoData(): Promise<void> {
         });
       });
 
+      await db.standards.bulkPut(standards);
       await db.arrays.bulkPut(arrayRows);
       await db.stations.bulkPut(stationRows);
       await db.instruments.bulkPut(instrumentRows);
@@ -549,13 +757,15 @@ export async function initDatabase(): Promise<void> {
     await seedDemoData();
   }
   stampDbVersion();
+  // 注：v2→v3 升级后旧标定生效值的“按份补算”由 App 启动流程调用 recomputeAll() 完成，
+  // 放在 db 模块之外以避免 db ↔ recompute 的循环依赖；标准器台账在重算中只读、不被改动。
 }
 
-/** 清空全部业务表（导入覆盖与重置共用） */
+/** 清空全部业务表（导入覆盖与重置共用；不清空会被导入文件整体覆盖，这里一并清空） */
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.standards],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,6 +773,7 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.standards.clear(),
       ]);
     }
   );
@@ -576,14 +787,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, standards] = await Promise.all([
     db.arrays.count(),
     db.stations.count(),
     db.instruments.count(),
     db.calibrations.count(),
     db.replaces.count(),
+    db.standards.count(),
   ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  return { arrays, stations, instruments, calibrations, replaces, standards };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */

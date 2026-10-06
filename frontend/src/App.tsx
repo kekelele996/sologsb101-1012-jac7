@@ -10,6 +10,7 @@ import {
   DashboardOutlined,
   ExperimentOutlined,
   GlobalOutlined,
+  SafetyCertificateOutlined,
   SwapOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
@@ -30,7 +31,10 @@ import {
   selectReplaces,
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
+import { startStandardSubscription, selectStandards } from '@/stores/standardSlice';
+import { isEffectUsable } from '@/types/calibration';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
+import { recomputeAll } from '@/utils/recompute';
 
 const { Header, Sider, Content, Footer } = Layout;
 
@@ -38,6 +42,7 @@ const { Header, Sider, Content, Footer } = Layout;
 function buildSelectedKey(pathname: string, currentArrayId: string | null): string {
   if (pathname.startsWith('/calibrations')) return ROUTES.calibrations;
   if (pathname.startsWith('/replacements')) return ROUTES.replacements;
+  if (pathname.startsWith('/standards')) return ROUTES.standards;
   if (pathname.startsWith('/geometry')) return ROUTES.geometry;
   if (pathname.startsWith('/stations/') && currentArrayId) return ROUTES.stations(currentArrayId);
   return ROUTES.arrays;
@@ -54,6 +59,7 @@ export default function App() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const standards = useAppSelector(selectStandards);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
   const ready = useAppSelector((state) => state.array.ready);
 
@@ -67,6 +73,9 @@ export default function App() {
         startArraySubscription(dispatch);
         startInstrumentSubscription(dispatch);
         startCalibrationSubscription(dispatch);
+        startStandardSubscription(dispatch);
+        // v2→v3 升级后把旧标定的生效值按份补算（待重算/重算失败）；标准器台账只读
+        await recomputeAll();
       } catch (error) {
         if (cancelled) return;
         messageApi.error(
@@ -81,8 +90,16 @@ export default function App() {
 
   const currentArray = arrays.find((row) => row.id === currentArrayId) ?? null;
   const selectedKey = buildSelectedKey(location.pathname, currentArrayId);
-  const unqualified = calibrations.filter((row) => row.responseVerdict === '不合格').length;
+  // 侧栏与顶帽一律按“生效口径”计数：待重算 / 重算失败的结论单列，不冒充合格
+  const usableCalibrations = calibrations.filter((row) => isEffectUsable(row.effectStatus));
+  const unqualified = usableCalibrations.filter((row) => row.effectiveVerdict === '不合格').length;
+  const effectPending = calibrations.length - usableCalibrations.length;
   const pendingReplaces = replaces.filter((row) => row.state !== '已复核').length;
+  const today = new Date().toISOString().slice(0, 10);
+  const expiredStandards = standards.filter((standard) => {
+    if (standard.state === '停用') return false;
+    return !standard.certificates.some((cert) => today >= cert.validFrom && today <= cert.validUntil);
+  }).length;
 
   return (
     <>
@@ -118,6 +135,7 @@ export default function App() {
               },
               { key: ROUTES.calibrations, icon: <DashboardOutlined />, label: '标定记录台' },
               { key: ROUTES.replacements, icon: <SwapOutlined />, label: '合格评定与更换' },
+              { key: ROUTES.standards, icon: <SafetyCertificateOutlined />, label: '标准器与溯源（计量站）' },
               { key: ROUTES.geometry, icon: <GlobalOutlined />, label: '台阵几何与备份' },
             ]}
           />
@@ -130,7 +148,12 @@ export default function App() {
                 <ExperimentOutlined /> 仪器 {instruments.length}
               </span>
               <span>
-                <ThunderboltOutlined /> 标定 {calibrations.length} · 不合格 {unqualified}
+                <SafetyCertificateOutlined /> 标准器 {standards.length}
+                {expiredStandards > 0 ? ` · 过期 ${expiredStandards}` : ''}
+              </span>
+              <span>
+                <ThunderboltOutlined /> 标定 {calibrations.length} · 生效不合格 {unqualified}
+                {effectPending > 0 ? ` · 待重算 ${effectPending}` : ''}
               </span>
               <span>
                 <SwapOutlined /> 更换未闭环 {pendingReplaces}
@@ -170,8 +193,10 @@ export default function App() {
             </Space>
             <Space>
               <Badge count={calibrations.length} showZero color="#3f7bbf" title="标定记录总数" />
-              <Badge count={unqualified} showZero color="#c0392b" title="不合格标定" />
+              <Badge count={unqualified} showZero color="#c0392b" title="生效口径不合格标定" />
+              <Badge count={effectPending} showZero color="#d68910" title="待重算/重算失败（未计入合格率）" />
               <Badge count={pendingReplaces} showZero color="#d68910" title="未闭环更换" />
+              <Badge count={expiredStandards} showZero color="#7d3c98" title="校准过期标准器" />
               {currentArrayId ? (
                 <Button size="small" onClick={() => navigate(ROUTES.stations(currentArrayId))}>
                   台站仪器

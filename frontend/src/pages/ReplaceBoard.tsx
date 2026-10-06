@@ -53,6 +53,7 @@ import {
   type ReplaceState,
 } from '@/types/replace';
 import { daysUntilDue, type Instrument } from '@/types/instrument';
+import { isEffectUsable } from '@/types/calibration';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
 import { initDatabase } from '@/utils/db';
 
@@ -66,7 +67,7 @@ interface ReplaceFormValues {
   remark: string;
 }
 
-/** 仪器评定行：标定结论、待标定天数与更换状态 */
+/** 仪器评定行：标定结论、待标定天数与更换状态（结论统一生效口径） */
 interface AssessmentRow {
   instrument: Instrument;
   stationCode: string;
@@ -75,7 +76,12 @@ interface AssessmentRow {
   lastDate: string;
   dueInDays: number;
   overdue: boolean;
+  /** 最近一次生效结论；待重算/重算失败显示 待判定 且不充当合格 */
   lastVerdict: string;
+  /** 最近一次结论是否生效可用 */
+  lastUsable: boolean;
+  /** 待重算 / 重算失败份数（单列提醒，不计入不合格） */
+  effectIssueCount: number;
   calibrationCount: number;
   replace: Replace | null;
 }
@@ -114,6 +120,8 @@ export default function ReplaceBoard() {
         const latest = own[0];
         const lastDate = latest ? latest.date : instrument.installDate;
         const dueInDays = daysUntilDue(lastDate, instrument.installDate);
+        const lastUsable = latest ? isEffectUsable(latest.effectStatus) : false;
+        const effectIssueCount = own.filter((row) => !isEffectUsable(row.effectStatus)).length;
         const replace =
           replaces
             .filter((row) => row.instrumentId === instrument.id)
@@ -126,7 +134,10 @@ export default function ReplaceBoard() {
           lastDate,
           dueInDays,
           overdue: dueInDays < 0,
-          lastVerdict: latest ? latest.responseVerdict : '待判定',
+          // 更换提醒只认生效结论；待重算/重算失败不冒充合格，显示待判定
+          lastVerdict: latest ? (lastUsable ? latest.effectiveVerdict : '待判定') : '待判定',
+          lastUsable,
+          effectIssueCount,
           calibrationCount: own.length,
           replace,
         };
@@ -150,11 +161,12 @@ export default function ReplaceBoard() {
   const totals = useMemo(() => {
     const overdue = rows.filter((row) => row.overdue).length;
     const unqualified = rows.filter((row) => row.lastVerdict === '不合格').length;
+    const effectIssue = rows.reduce((sum, row) => sum + (row.effectIssueCount > 0 ? 1 : 0), 0);
     const pendingReplace = replaces.filter((row) => row.state === '待更换').length;
     const closedReplace = replaces.filter((row) => row.state === '已复核').length;
     const cycleRate =
       rows.length === 0 ? 0 : Number((((rows.length - overdue) / rows.length) * 100).toFixed(1));
-    return { instruments: rows.length, overdue, unqualified, pendingReplace, closedReplace, cycleRate };
+    return { instruments: rows.length, overdue, unqualified, effectIssue, pendingReplace, closedReplace, cycleRate };
   }, [replaces, rows]);
 
   const replaceRows = useMemo(
@@ -256,6 +268,15 @@ export default function ReplaceBoard() {
 
   /** 超期仪器提醒（标定周期 365 天） */
   const overdueHistories = histories.filter((history) => history.overdue);
+  /** 生效口径待重算 / 重算失败提醒（单列，不触发更换） */
+  const effectIssueInstrumentIds = useMemo(() => {
+    const set = new Set<string>();
+    calibrations.forEach((row) => {
+      if (!isEffectUsable(row.effectStatus)) set.add(row.instrumentId);
+    });
+    return set;
+  }, [calibrations]);
+  const effectIssueList = histories.filter((history) => effectIssueInstrumentIds.has(history.instrument.id));
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
@@ -267,7 +288,8 @@ export default function ReplaceBoard() {
             合格评定与更换提醒
           </Typography.Title>
           <p className="gb-hint">
-            按标定周期（365 天）与脉冲响应结论评定仪器是否合格；超期未标定与不合格仪器高亮提示，可直接登记更换并跟踪到复核闭环。
+            按标定周期（365 天）与<b> 生效响应结论</b>评定：标准器过期的结论已折算生效值后再判定，待重算 / 重算失败的结论单列、不冒充合格也不触发更换。
+            超期未标定与生效不合格仪器高亮提示，可登记更换并跟踪到复核闭环。
           </p>
         </div>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => openCreate()}>
@@ -288,6 +310,13 @@ export default function ReplaceBoard() {
           value={totals.unqualified}
           suffix="台"
           tone={totals.unqualified > 0 ? 'warning' : 'success'}
+        />
+        <StatBadge
+          label="结论待重算"
+          value={totals.effectIssue}
+          suffix="台"
+          tone={totals.effectIssue > 0 ? 'warning' : 'success'}
+          tip="有标定结论待重算/重算失败，已单列、不计入不合格"
         />
         <StatBadge label="按期标定率" value={totals.cycleRate} percent={totals.cycleRate} tone="success" />
         <StatBadge label="待更换" value={totals.pendingReplace} suffix="条" tone="warning" />
@@ -311,6 +340,23 @@ export default function ReplaceBoard() {
       ) : (
         <Alert type="success" showIcon message="全部仪器均在标定周期内，无需特别提醒" />
       )}
+
+      {effectIssueList.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          message={`${effectIssueList.length} 台仪器存在待重算 / 重算失败的标定结论：标准器未挂或已过期且无法折算，已单列，不纳入合格率也不据此发起更换`}
+          description={
+            <span>
+              请到
+              <Button type="link" size="small" onClick={() => navigate(ROUTES.calibrations)}>
+                标定记录台
+              </Button>
+              补挂当时在用标准器或逐份重试；标准器有效期与溯源证书在「标准器与溯源（计量站）」页维护。
+            </span>
+          }
+        />
+      ) : null}
 
       <FilterBar
         modelValue={filterModel}
@@ -346,7 +392,13 @@ export default function ReplaceBoard() {
           className="gb-table-compact"
           dataSource={rows}
           pagination={{ pageSize: 10, showSizeChanger: false }}
-          rowClassName={(row) => (row.overdue || row.lastVerdict === '不合格' ? 'gb-row-danger' : '')}
+          rowClassName={(row) =>
+            row.overdue || row.lastVerdict === '不合格'
+              ? 'gb-row-danger'
+              : row.effectIssueCount > 0
+                ? 'gb-row-warning'
+                : ''
+          }
           columns={[
             {
               title: '仪器',
@@ -390,9 +442,18 @@ export default function ReplaceBoard() {
               ),
             },
             {
-              title: '标定结论',
-              width: 150,
-              render: (_: unknown, row: AssessmentRow) => <QualifyTag verdict={row.lastVerdict as never} size="small" />,
+              title: '生效结论',
+              width: 170,
+              render: (_: unknown, row: AssessmentRow) => (
+                <div>
+                  <QualifyTag verdict={row.lastVerdict as never} size="small" />
+                  {row.effectIssueCount > 0 ? (
+                    <div className="gb-hint" style={{ color: '#d68910' }}>
+                      {row.effectIssueCount} 份待重算（单列）
+                    </div>
+                  ) : null}
+                </div>
+              ),
             },
             {
               title: '仪器状态',

@@ -108,8 +108,23 @@ body::before {
   font-weight: 600;
 }
 
+.gb-warning {
+  color: #d68910;
+  font-weight: 600;
+}
+
 .gb-table-compact .ant-table-cell {
   padding: 8px 8px !important;
+}
+
+/* 超期 / 生效不合格行高亮 */
+.gb-row-danger > .ant-table-cell {
+  background: #fdecea !important;
+}
+
+/* 待重算 / 重算失败行高亮（单列，区别于红行） */
+.gb-row-warning > .ant-table-cell {
+  background: #fff6e5 !important;
 }
 
 /* 灵敏度趋势图容器 */

@@ -48,8 +48,9 @@ import {
 import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
 import { APERTURE_BUCKETS, ARRAY_STATES, type ArrayState, type SeisArray } from '@/types/array';
-import { apertureKm, round } from '@/utils/geo';
+import { apertureKm } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
+import { effectQualifyStats } from '@/utils/export';
 
 interface ArrayFormValues {
   name: string;
@@ -132,9 +133,7 @@ export default function ArrayList() {
         const arrayCalibrations = calibrations.filter((calibration) =>
           instrumentIds.has(calibration.instrumentId)
         );
-        const unqualified = arrayCalibrations.filter(
-          (calibration) => calibration.responseVerdict === '不合格'
-        ).length;
+        const stats = effectQualifyStats(arrayCalibrations);
         const pendingReplace = replaces.filter(
           (replace) => instrumentIds.has(replace.instrumentId) && replace.state !== '已复核'
         ).length;
@@ -151,13 +150,12 @@ export default function ArrayList() {
           stationCount: arrayStations.length,
           instrumentCount: arrayInstruments.length,
           calibrationCount: arrayCalibrations.length,
-          unqualified,
+          unqualified: stats.unqualified,
+          pendingEffect: stats.pending,
           pendingReplace,
           computedApertureKm: computed,
-          qualifyRate:
-            arrayCalibrations.length === 0
-              ? 0
-              : round(((arrayCalibrations.length - unqualified) / arrayCalibrations.length) * 100, 1),
+          // 生效合格率：待重算/重算失败单列，不进分母
+          qualifyRate: stats.rate,
         };
       }),
     [calibrations, filtered, instruments, replaces, stations]
@@ -384,11 +382,12 @@ export default function ArrayList() {
                   <StatBadge label="台站" value={card.stationCount} suffix="个" size="small" tone="info" />
                   <StatBadge label="仪器" value={card.instrumentCount} suffix="台" size="small" />
                   <StatBadge
-                    label="标定合格率"
+                    label="生效合格率"
                     value={card.qualifyRate}
                     percent={card.qualifyRate}
                     size="small"
                     tone={card.unqualified > 0 ? 'warning' : 'success'}
+                    tip={card.pendingEffect > 0 ? `${card.pendingEffect} 份待重算单列，未计入` : undefined}
                   />
                 </div>
                 <Space direction="vertical" size={4} style={{ fontSize: 13, color: '#5b6b78' }}>
@@ -399,7 +398,10 @@ export default function ArrayList() {
                   <span>
                     累计标定 <b className="gb-mono">{card.calibrationCount}</b> 次
                     {card.unqualified > 0 ? (
-                      <span className="gb-danger"> · 不合格 {card.unqualified} 次</span>
+                      <span className="gb-danger"> · 生效不合格 {card.unqualified} 次</span>
+                    ) : null}
+                    {card.pendingEffect > 0 ? (
+                      <span className="gb-warning"> · 待重算 {card.pendingEffect} 份</span>
                     ) : null}
                   </span>
                   <span>管理部门：{card.row.department || '未填写'}</span>

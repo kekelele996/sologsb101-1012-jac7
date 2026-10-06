@@ -72,6 +72,7 @@ import {
 } from '@/types/instrument';
 import { formatLatLng, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
+import { effectQualifyStats } from '@/utils/export';
 
 interface StationFormValues {
   code: string;
@@ -161,9 +162,8 @@ export default function StationInstruments() {
           const stationCalibrations = calibrations.filter((calibration) =>
             instrumentIds.has(calibration.instrumentId)
           );
-          const unqualified = stationCalibrations.filter(
-            (calibration) => calibration.responseVerdict === '不合格'
-          ).length;
+          const effect = effectQualifyStats(stationCalibrations);
+          const unqualified = effect.unqualified;
           const overdue = stationInstruments.filter((instrument) => {
             const own = calibrations
               .filter((calibration) => calibration.instrumentId === instrument.id)
@@ -176,8 +176,9 @@ export default function StationInstruments() {
             instruments: stationInstruments,
             calibrationCount: stationCalibrations.length,
             unqualified,
+            pendingEffect: effect.pending,
             overdue,
-            worstVerdict: unqualified > 0 ? '不合格' : stationCalibrations.length > 0 ? '合格' : '待判定',
+            worstVerdict: unqualified > 0 ? '不合格' : effect.usable > 0 ? '合格' : '待判定',
           };
         }),
     [allInstruments, calibrations, stationFilter, stations]
