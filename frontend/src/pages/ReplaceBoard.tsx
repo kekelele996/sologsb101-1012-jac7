@@ -40,6 +40,7 @@ import {
   removeReplace,
   resetReplaceFilter,
   selectCalibrations,
+  selectEffectiveVerdicts,
   selectReplaceFilter,
   selectReplaces,
   transitionReplace,
@@ -90,6 +91,7 @@ export default function ReplaceBoard() {
   const arrays = useAppSelector(selectArrays);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const effectiveVerdicts = useAppSelector(selectEffectiveVerdicts);
   const filter = useAppSelector(selectReplaceFilter);
   const { histories } = useCalibHistory();
 
@@ -118,6 +120,7 @@ export default function ReplaceBoard() {
           replaces
             .filter((row) => row.instrumentId === instrument.id)
             .sort((a, b) => b.date.localeCompare(a.date))[0] ?? null;
+        const lastEffective = latest ? effectiveVerdicts.get(latest.id) : null;
         return {
           instrument,
           stationCode: station?.code ?? '未知台站',
@@ -126,7 +129,7 @@ export default function ReplaceBoard() {
           lastDate,
           dueInDays,
           overdue: dueInDays < 0,
-          lastVerdict: latest ? latest.responseVerdict : '待判定',
+          lastVerdict: lastEffective?.verdict ?? '待判定',
           calibrationCount: own.length,
           replace,
         };
@@ -145,7 +148,7 @@ export default function ReplaceBoard() {
         return true;
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, filter, instruments, replaces, stations]);
+  }, [arrays, calibrations, effectiveVerdicts, filter, instruments, replaces, stations]);
 
   const totals = useMemo(() => {
     const overdue = rows.filter((row) => row.overdue).length;

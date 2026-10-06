@@ -58,7 +58,7 @@ import {
   selectInstrumentsOfStation,
   updateInstrument,
 } from '@/stores/instrumentSlice';
-import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectCalibrations, selectEffectiveVerdicts, selectReplaces } from '@/stores/calibrationSlice';
 import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
 import {
   COMMON_MODELS,
@@ -114,6 +114,7 @@ export default function StationInstruments() {
   const stationFilter = useAppSelector(selectStationFilter);
   const allInstruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
+  const effectiveVerdicts = useAppSelector(selectEffectiveVerdicts);
   const replaces = useAppSelector(selectReplaces);
 
   const [stationModalOpen, setStationModalOpen] = useState(false);
@@ -162,7 +163,7 @@ export default function StationInstruments() {
             instrumentIds.has(calibration.instrumentId)
           );
           const unqualified = stationCalibrations.filter(
-            (calibration) => calibration.responseVerdict === '不合格'
+            (calibration) => effectiveVerdicts.get(calibration.id)?.verdict === '不合格'
           ).length;
           const overdue = stationInstruments.filter((instrument) => {
             const own = calibrations
@@ -626,9 +627,10 @@ export default function StationInstruments() {
                     if (!latest) {
                       return <span className="gb-hint">尚未标定</span>;
                     }
+                    const effective = effectiveVerdicts.get(latest.id);
                     return (
                       <QualifyTag
-                        verdict={latest.responseVerdict}
+                        verdict={effective?.verdict ?? '待判定'}
                         sensitivity={round(latest.sensitivity, 2)}
                         size="small"
                       />

@@ -7,6 +7,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   App as AntdApp,
+  Alert,
   Button,
   Card,
   Col,
@@ -21,9 +22,16 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
-import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
+import {
+  DeleteOutlined,
+  EditOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+  SafetyCertificateOutlined,
+} from '@ant-design/icons';
 import dayjs from 'dayjs';
 import FilterBar from '@/components/common/FilterBar';
 import type { FilterModel } from '@/types/filter';
@@ -33,17 +41,25 @@ import EmptyPanel from '@/components/common/EmptyPanel';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectStandards } from '@/stores/standardSlice';
 import {
   bulkSetVerdict,
   createCalibration,
   patchFilter,
+  recomputeEffectiveVerdicts,
   removeCalibration,
   resetFilter,
+  retryEffectiveVerdict,
   selectCalibrationFilter,
   selectCalibrations,
+  selectEffectiveVerdicts,
+  selectEffectiveVersion,
+  selectFailedCalibrationIds,
+  selectRecomputeReceipt,
   updateCalibration,
 } from '@/stores/calibrationSlice';
 import {
+  EFFECTIVE_VERDICTS,
   RESPONSE_VERDICTS,
   SELF_NOISE_LIMIT,
   SENSITIVITY_RANGE,
@@ -54,11 +70,13 @@ import {
   type ResponseVerdict,
 } from '@/types/calibration';
 import { INSTRUMENT_TYPES, type InstrumentType } from '@/types/instrument';
+import type { EffectiveVerdict } from '@/types/calibration';
 import { round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
 
 interface CalibrationFormValues {
   instrumentId: string;
+  standardId: string | null;
   date: dayjs.Dayjs | null;
   sensitivity: number;
   selfNoise: number;
@@ -78,6 +96,10 @@ interface CalibrationRow {
   arrayName: string;
   arrayId: string;
   delta: ReturnType<typeof sensitivityDelta>;
+  effectiveVerdict: EffectiveVerdict;
+  verdictBasis: string;
+  standardName: string;
+  standardValid: boolean;
 }
 
 export default function CalibrationBoard() {
@@ -90,6 +112,11 @@ export default function CalibrationBoard() {
   const instruments = useAppSelector(selectInstruments);
   const stations = useAppSelector(selectStations);
   const arrays = useAppSelector(selectArrays);
+  const standards = useAppSelector(selectStandards);
+  const effectiveVerdicts = useAppSelector(selectEffectiveVerdicts);
+  const effectiveVersion = useAppSelector(selectEffectiveVersion);
+  const recomputeReceipt = useAppSelector(selectRecomputeReceipt);
+  const failedCalibrationIds = useAppSelector(selectFailedCalibrationIds);
   const filter = useAppSelector(selectCalibrationFilter);
 
   const [modalOpen, setModalOpen] = useState(false);
@@ -154,6 +181,7 @@ export default function CalibrationBoard() {
     return calibrations
       .map((row) => {
         const info = instrumentIndex.get(row.instrumentId);
+        const effective = effectiveVerdicts.get(row.id);
         return {
           row,
           instrumentModel: info?.model ?? '仪器已删除',
@@ -163,24 +191,30 @@ export default function CalibrationBoard() {
           arrayName: info?.arrayName ?? '—',
           arrayId: info?.arrayId ?? '',
           delta: deltaIndex.get(row.id) ?? sensitivityDelta(row.sensitivity, null),
+          effectiveVerdict: effective?.verdict ?? '待判定',
+          verdictBasis: effective?.basis ?? '',
+          standardName: effective?.standardName ?? '',
+          standardValid: effective?.standardValid ?? false,
         };
       })
       .filter((item) => {
         const keyword = filter.keyword.trim();
         if (keyword.length > 0) {
-          const haystack = `${item.instrumentModel}${item.serialNo}${item.stationCode}${item.arrayName}${item.row.operator}${item.row.agency}`;
+          const haystack = `${item.instrumentModel}${item.serialNo}${item.stationCode}${item.arrayName}${item.row.operator}${item.row.agency}${item.standardName}`;
           if (!haystack.includes(keyword)) return false;
         }
-        if (filter.verdicts.length > 0 && !filter.verdicts.includes(item.row.responseVerdict)) return false;
+        if (filter.verdicts.length > 0 && !filter.verdicts.includes(item.effectiveVerdict)) return false;
         if (filter.instrumentTypes.length > 0 && !filter.instrumentTypes.includes(item.instrumentType)) return false;
-        if (filter.onlyOverdue && item.row.responseVerdict !== '不合格') return false;
+        if (filter.onlyOverdue && item.effectiveVerdict !== '不合格') return false;
         return true;
       })
       .sort((a, b) => b.row.date.localeCompare(a.row.date));
-  }, [calibrations, deltaIndex, filter, instrumentIndex]);
+  }, [calibrations, deltaIndex, effectiveVerdicts, filter, instrumentIndex]);
 
   const totals = useMemo(() => {
-    const unqualified = rows.filter((item) => item.row.responseVerdict === '不合格').length;
+    const unqualified = rows.filter((item) => item.effectiveVerdict === '不合格').length;
+    const invalidBasis = rows.filter((item) => item.effectiveVerdict === '依据失效').length;
+    const noStandard = rows.filter((item) => !item.row.standardId).length;
     const meanSensitivity =
       rows.length === 0
         ? 0
@@ -190,7 +224,9 @@ export default function CalibrationBoard() {
     return {
       count: rows.length,
       unqualified,
-      qualifyRate: rows.length === 0 ? 0 : round(((rows.length - unqualified) / rows.length) * 100, 1),
+      invalidBasis,
+      noStandard,
+      qualifyRate: rows.length === 0 ? 0 : round(((rows.length - unqualified - invalidBasis) / rows.length) * 100, 1),
       meanSensitivity,
       meanNoise,
       operatorCount: new Set(rows.map((item) => item.row.operator)).size,
@@ -221,6 +257,7 @@ export default function CalibrationBoard() {
     const range = SENSITIVITY_RANGE[type];
     form.setFieldsValue({
       instrumentId: firstInstrument?.id ?? '',
+      standardId: standards[0]?.id ?? null,
       date: dayjs(),
       sensitivity: round((range.min + range.max) / 2, 2),
       selfNoise: 1.5,
@@ -236,6 +273,7 @@ export default function CalibrationBoard() {
     setEditingId(row.id);
     form.setFieldsValue({
       instrumentId: row.instrumentId,
+      standardId: row.standardId,
       date: dayjs(row.date),
       sensitivity: row.sensitivity,
       selfNoise: row.selfNoise,
@@ -253,6 +291,7 @@ export default function CalibrationBoard() {
     try {
       const payload = {
         instrumentId: values.instrumentId,
+        standardId: values.standardId ?? null,
         date: values.date ? values.date.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
         sensitivity: Number(values.sensitivity),
         selfNoise: Number(values.selfNoise),
@@ -286,11 +325,29 @@ export default function CalibrationBoard() {
     setSelectedKeys([]);
   };
 
+  const handleRecompute = async () => {
+    const result = await dispatch(recomputeEffectiveVerdicts()).unwrap();
+    if (result.failed.length > 0) {
+      message.warning(`重算完成，${result.failed.length} 条失败，可在下方单条重试`);
+    } else {
+      message.success(`生效结论已重算一版（v${result.version}），回填标准器 ${result.relinked} 条`);
+    }
+  };
+
+  const handleRetry = async (calibrationId: string) => {
+    const result = await dispatch(retryEffectiveVerdict(calibrationId)).unwrap();
+    if (result.ok) {
+      message.success(`标定 ${calibrationId} 生效结论已重出`);
+    } else {
+      message.error(`重出失败：${result.reason}`);
+    }
+  };
+
   const handleFilterChange = (next: FilterModel, switchValue: boolean) => {
     dispatch(
       patchFilter({
         keyword: next.keyword,
-        verdicts: ((next.verdicts as string[]) ?? []) as ResponseVerdict[],
+        verdicts: ((next.verdicts as string[]) ?? []) as EffectiveVerdict[],
         instrumentTypes: (next.instrumentTypes as string[]) ?? [],
         onlyOverdue: switchValue,
       })
@@ -354,6 +411,13 @@ export default function CalibrationBoard() {
           <Button icon={<ReloadOutlined />} onClick={() => void initDatabase()}>
             补齐演示数据
           </Button>
+          <Button
+            icon={<SafetyCertificateOutlined />}
+            onClick={() => void handleRecompute()}
+            title="按当前标准器台账重算全部标定的生效结论"
+          >
+            重算生效结论
+          </Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
             新增标定记录
           </Button>
@@ -368,19 +432,48 @@ export default function CalibrationBoard() {
           suffix="次"
           tone={totals.unqualified > 0 ? 'danger' : 'success'}
         />
+        <StatBadge
+          label="依据失效"
+          value={totals.invalidBasis}
+          suffix="次"
+          tone={totals.invalidBasis > 0 ? 'warning' : 'success'}
+        />
         <StatBadge label="合格率" value={totals.qualifyRate} percent={totals.qualifyRate} tone="success" />
         <StatBadge label="平均灵敏度" value={totals.meanSensitivity} suffix="V·s/m" tone="info" />
         <StatBadge label="平均自噪" value={totals.meanNoise} suffix="" tone="warning" />
         <StatBadge label="标定人" value={totals.operatorCount} suffix="人" tone="default" />
       </div>
 
+      {recomputeReceipt ? (
+        <Alert
+          type="info"
+          showIcon
+          message={`生效结论版本 v${effectiveVersion}`}
+          description={
+            <Space direction="vertical" size={4}>
+              <span>{recomputeReceipt}</span>
+              {failedCalibrationIds.length > 0 ? (
+                <Space size={6} wrap>
+                  <span className="gb-hint">失败记录：</span>
+                  {failedCalibrationIds.map((id) => (
+                    <Button key={id} size="small" onClick={() => void handleRetry(id)}>
+                      重试 {id}
+                    </Button>
+                  ))}
+                </Space>
+              ) : null}
+            </Space>
+          }
+        />
+      ) : null}
+
       <FilterBar
         modelValue={filterModel}
         selects={[
           {
             key: 'verdicts',
-            label: '响应结论',
-            options: RESPONSE_VERDICTS.map((verdict) => ({ label: verdict, value: verdict })),
+            label: '生效结论',
+            options: EFFECTIVE_VERDICTS.map((verdict) => ({ label: verdict, value: verdict })),
           },
           {
             key: 'instrumentTypes',
@@ -478,15 +571,44 @@ export default function CalibrationBoard() {
               ),
             },
             {
-              title: '响应结论',
-              width: 190,
+              title: '生效结论',
+              width: 200,
               render: (_: unknown, item: CalibrationRow) => (
-                <QualifyTag
-                  verdict={item.row.responseVerdict}
-                  sensitivity={item.row.sensitivity}
-                  selfNoise={item.row.selfNoise}
-                  size="small"
-                />
+                <div>
+                  <QualifyTag
+                    verdict={item.effectiveVerdict}
+                    sensitivity={item.row.sensitivity}
+                    selfNoise={item.row.selfNoise}
+                    size="small"
+                  />
+                  <Tooltip title={item.verdictBasis || '无依据'}>
+                    <div className="gb-hint" style={{ marginTop: 2, cursor: 'help' }}>
+                      {item.standardName ? `依据：${item.standardName}` : '未挂标准器'}
+                    </div>
+                  </Tooltip>
+                </div>
+              ),
+            },
+            {
+              title: '标准器',
+              width: 170,
+              render: (_: unknown, item: CalibrationRow) => (
+                <div>
+                  {item.standardName ? (
+                    <>
+                      <div>{item.standardName}</div>
+                      <div className="gb-hint">
+                        {item.standardValid ? (
+                          <span className="gb-mono">有效期内</span>
+                        ) : (
+                          <span className="gb-danger gb-mono">标定时已过期</span>
+                        )}
+                      </div>
+                    </>
+                  ) : (
+                    <span className="gb-hint">未挂接</span>
+                  )}
+                </div>
               ),
             },
             {
@@ -617,6 +739,18 @@ export default function CalibrationBoard() {
                 const range = SENSITIVITY_RANGE[instrument?.type ?? '宽频带'];
                 form.setFieldValue('sensitivity', round((range.min + range.max) / 2, 2));
               }}
+            />
+          </Form.Item>
+          <Form.Item name="standardId" label="比对标准器（计量站台账）">
+            <Select
+              showSearch
+              allowClear
+              optionFilterProp="label"
+              placeholder="选择标定时比对的标准器"
+              options={standards.map((standard) => ({
+                label: `${standard.name} ${standard.model}（${standard.serialNo}）`,
+                value: standard.id,
+              }))}
             />
           </Form.Item>
           <Row gutter={12}>

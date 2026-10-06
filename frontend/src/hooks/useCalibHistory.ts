@@ -6,7 +6,7 @@ import { useCallback, useMemo } from 'react';
 import { useSelector } from 'react-redux';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
-import { selectCalibrations } from '@/stores/calibrationSlice';
+import { selectCalibrations, selectEffectiveVerdicts } from '@/stores/calibrationSlice';
 import { calibrateDueText, sensitivityDelta, type SensitivityDelta } from '@/types/calibration';
 import { CALIBRATION_CYCLE_DAYS, daysUntilDue } from '@/types/instrument';
 import type { Calibration, ResponseVerdict } from '@/types/calibration';
@@ -56,6 +56,7 @@ export function useCalibHistory(): UseCalibHistoryResult {
   const stations = useSelector(selectStations);
   const instruments = useSelector(selectInstruments);
   const calibrations = useSelector(selectCalibrations);
+  const effectiveVerdicts = useSelector(selectEffectiveVerdicts);
 
   const histories = useMemo<InstrumentCalibHistory[]>(() => {
     return instruments
@@ -70,7 +71,9 @@ export function useCalibHistory(): UseCalibHistoryResult {
         const delta = sensitivityDelta(latest?.sensitivity ?? 0, previous ? previous.sensitivity : null);
         const dueInDays = daysUntilDue(latest ? latest.date : null, instrument.installDate);
         const worstVerdict = rows.reduce<ResponseVerdict>((worst, row) => {
-          return VERDICT_ORDER[row.responseVerdict] > VERDICT_ORDER[worst] ? row.responseVerdict : worst;
+          const effective = effectiveVerdicts.get(row.id)?.verdict ?? '待判定';
+          const order = VERDICT_ORDER[effective as ResponseVerdict] ?? 1;
+          return order > VERDICT_ORDER[worst] ? (effective as ResponseVerdict) : worst;
         }, '合格');
         return {
           instrument,
@@ -91,7 +94,7 @@ export function useCalibHistory(): UseCalibHistoryResult {
         };
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, instruments, stations]);
+  }, [arrays, calibrations, effectiveVerdicts, instruments, stations]);
 
   const historyOf = useCallback(
     (instrumentId: string): InstrumentCalibHistory | null =>

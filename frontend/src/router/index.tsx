@@ -11,6 +11,7 @@ const ArrayList = lazy(() => import('@/pages/ArrayList'));
 const StationInstruments = lazy(() => import('@/pages/StationInstruments'));
 const CalibrationBoard = lazy(() => import('@/pages/CalibrationBoard'));
 const ReplaceBoard = lazy(() => import('@/pages/ReplaceBoard'));
+const StandardLedger = lazy(() => import('@/pages/StandardLedger'));
 const GeometryView = lazy(() => import('@/pages/GeometryView'));
 
 /** 懒加载页面占位 */
@@ -34,6 +35,7 @@ export const ROUTES = {
   stations: (arrayId: string): string => `/stations/${arrayId}/instruments`,
   calibrations: '/calibrations',
   replacements: '/replacements',
+  standards: '/standards',
   geometry: '/geometry',
 } as const;
 
@@ -47,6 +49,7 @@ export const appRoutes: RouteObject[] = [
       { path: 'stations/:id/instruments', element: withSuspense(<StationInstruments />) },
       { path: 'calibrations', element: withSuspense(<CalibrationBoard />) },
       { path: 'replacements', element: withSuspense(<ReplaceBoard />) },
+      { path: 'standards', element: withSuspense(<StandardLedger />) },
       { path: 'geometry', element: withSuspense(<GeometryView />) },
       { path: '*', element: <Navigate to={ROUTES.arrays} replace /> },
     ],

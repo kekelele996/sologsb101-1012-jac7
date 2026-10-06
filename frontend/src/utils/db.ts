@@ -12,9 +12,11 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { Standard } from '@/types/standard';
+import { backfillStandardId } from '@/types/standard';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -24,6 +26,7 @@ export const LS_KEYS = {
   dbVersion: 'gbseisarray:db-version',
   lastBackupAt: 'gbseisarray:last-backup-at',
   lastArrayId: 'gbseisarray:last-array-id',
+  effectiveVersion: 'gbseisarray:effective-version',
 } as const;
 
 /** 备份文件结构，供 utils/export.ts 与几何页使用 */
@@ -36,6 +39,7 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  standards: Standard[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +48,7 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  standards!: Table<Standard, string>;
 
   constructor() {
     super(DB_NAME);
@@ -58,7 +63,7 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
@@ -84,6 +89,47 @@ export class SeisArrayDatabase extends Dexie {
               if (typeof row.createdAt !== 'number') row.createdAt = now;
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt;
               Object.assign(row, factory());
+            });
+        }
+      });
+
+    // v3：新增标准器台账表，标定记录挂接当时标准器并按标定日期回填
+    this.version(DB_VERSION)
+      .stores({
+        arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+        instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+        calibrations:
+          'id, instrumentId, standardId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+        replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+        standards: 'id, name, serialNo, certificateNo, calibrationDate, validUntil, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 迁移：标定记录补 standardId 字段（旧数据未记标准器号，先置 null，稍后按日期回填）
+        await tx
+          .table('calibrations')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (row.standardId === undefined) row.standardId = null;
+          });
+        // 若标准器台账为空（老用户升级），先播种演示标准器，再按标定日期回填
+        let standards = await tx.table('standards').toArray();
+        if (standards.length === 0) {
+          const demo = buildDemoStandards(Date.now());
+          await tx.table('standards').bulkPut(demo);
+          standards = demo;
+        }
+        if (standards.length > 0) {
+          await tx
+            .table('calibrations')
+            .toCollection()
+            .modify((row: Record<string, unknown>) => {
+              if (row.standardId !== null) return;
+              const linked = backfillStandardId(
+                row as unknown as Calibration,
+                standards as Standard[]
+              );
+              if (linked !== null) row.standardId = linked;
             });
         }
       });
@@ -119,6 +165,8 @@ export function watchTable<T>(
 interface SeedCalibration {
   id: string;
   instrumentId: string;
+  /** 标定时比对的标准器（计量站台账） */
+  standardId: string;
   date: string;
   sensitivity: number;
   selfNoise: number;
@@ -161,8 +209,66 @@ interface SeedArray {
   stations: SeedStation[];
 }
 
+/** 构建演示标准器台账（供播种与 v3 迁移共用） */
+function buildDemoStandards(now: number): Standard[] {
+  return [
+    {
+      id: 'std_vib_1',
+      name: '标准振动台',
+      model: 'ZD-3B',
+      serialNo: 'ZD3B-2022-01',
+      certificateNo: 'JL2022-0341',
+      calibrationDate: '2022-12-01',
+      validUntil: '2023-11-30',
+      agency: '省计量科学研究院',
+      remark: '宽频带与短周期标定主用',
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: 'std_vib_2',
+      name: '标准振动台',
+      model: 'ZD-3B',
+      serialNo: 'ZD3B-2023-02',
+      certificateNo: 'JL2023-0892',
+      calibrationDate: '2023-12-01',
+      validUntil: '2024-11-30',
+      agency: '省计量科学研究院',
+      remark: '宽频带与短周期标定主用',
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: 'std_sensor_1',
+      name: '标准传感器',
+      model: 'CS-200',
+      serialNo: 'CS200-2022-07',
+      certificateNo: 'JL2022-0115',
+      calibrationDate: '2022-01-15',
+      validUntil: '2023-01-14',
+      agency: '中国计量科学研究院',
+      remark: '强震通道标定用',
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: 'std_vib_expired',
+      name: '标准振动台',
+      model: 'ZD-2A',
+      serialNo: 'ZD2A-2021-03',
+      certificateNo: 'JL2021-0567',
+      calibrationDate: '2021-06-01',
+      validUntil: '2022-05-31',
+      agency: '省计量科学研究院',
+      remark: '已过有效期，仅作历史台账留存',
+      createdAt: now,
+      updatedAt: now,
+    },
+  ];
+}
+
 /**
- * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换，
+ * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换 + 4 台标准器，
  * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本。
  */
 export async function seedDemoData(): Promise<void> {
@@ -202,6 +308,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_ltx01_bb_1',
                   instrumentId: 'ins_ltx01_bb',
+                  standardId: 'std_vib_1',
                   date: '2023-04-20',
                   sensitivity: 1502.4,
                   selfNoise: 1.82,
@@ -212,6 +319,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_ltx01_bb_2',
                   instrumentId: 'ins_ltx01_bb',
+                  standardId: 'std_vib_2',
                   date: '2024-04-12',
                   sensitivity: 1468.9,
                   selfNoise: 1.95,
@@ -234,6 +342,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_ltx01_st_1',
                   instrumentId: 'ins_ltx01_st',
+                  standardId: 'std_sensor_1',
                   date: '2022-05-06',
                   sensitivity: 412.6,
                   selfNoise: 2.4,
@@ -268,6 +377,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_ltx02_bb_1',
                   instrumentId: 'ins_ltx02_bb',
+                  standardId: 'std_vib_2',
                   date: '2024-03-18',
                   sensitivity: 1204.8,
                   selfNoise: 1.42,
@@ -290,6 +400,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_ltx02_st_1',
                   instrumentId: 'ins_ltx02_st',
+                  standardId: 'std_vib_1',
                   date: '2023-03-10',
                   sensitivity: 265.2,
                   selfNoise: 4.8,
@@ -324,6 +435,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_ltx03_bb_1',
                   instrumentId: 'ins_ltx03_bb',
+                  standardId: 'std_vib_2',
                   date: '2024-09-05',
                   sensitivity: 2251.3,
                   selfNoise: 2.05,
@@ -368,6 +480,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_hx01_bb_1',
                   instrumentId: 'ins_hx01_bb',
+                  standardId: 'std_vib_1',
                   date: '2023-09-28',
                   sensitivity: 1498.2,
                   selfNoise: 2.25,
@@ -378,6 +491,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_hx01_bb_2',
                   instrumentId: 'ins_hx01_bb',
+                  standardId: 'std_vib_2',
                   date: '2024-09-30',
                   sensitivity: 1483.6,
                   selfNoise: 2.42,
@@ -400,6 +514,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_hx01_sm_1',
                   instrumentId: 'ins_hx01_sm',
+                  standardId: 'std_vib_2',
                   date: '2024-09-30',
                   sensitivity: 1.24,
                   selfNoise: 1.05,
@@ -434,6 +549,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_hx02_bb_1',
                   instrumentId: 'ins_hx02_bb',
+                  standardId: 'std_vib_expired',
                   date: '2023-06-11',
                   sensitivity: 1388.4,
                   selfNoise: 3.9,
@@ -448,6 +564,8 @@ export async function seedDemoData(): Promise<void> {
       ],
     },
   ];
+
+  const standards: Standard[] = buildDemoStandards(now);
 
   const replaces: Replace[] = [
     {
@@ -490,7 +608,7 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.standards],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -537,6 +655,7 @@ export async function seedDemoData(): Promise<void> {
       await db.instruments.bulkPut(instrumentRows);
       await db.calibrations.bulkPut(calibrationRows);
       await db.replaces.bulkPut(replaces);
+      await db.standards.bulkPut(standards);
     }
   );
 }
@@ -555,7 +674,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.standards],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,6 +682,7 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.standards.clear(),
       ]);
     }
   );
@@ -576,14 +696,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, standards] = await Promise.all([
     db.arrays.count(),
     db.stations.count(),
     db.instruments.count(),
     db.calibrations.count(),
     db.replaces.count(),
+    db.standards.count(),
   ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  return { arrays, stations, instruments, calibrations, replaces, standards };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */
@@ -636,4 +757,26 @@ export function writeLastArrayId(id: string | null): void {
   } catch {
     // 忽略
   }
+}
+
+/** 读取生效结论版本号（台网中心重算口径的版本） */
+export function readEffectiveVersion(): number {
+  try {
+    const raw = localStorage.getItem(LS_KEYS.effectiveVersion);
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+  } catch {
+    return 1;
+  }
+}
+
+/** 生效结论版本号 +1，返回新版本号 */
+export function bumpEffectiveVersion(): number {
+  const next = readEffectiveVersion() + 1;
+  try {
+    localStorage.setItem(LS_KEYS.effectiveVersion, String(next));
+  } catch {
+    // 忽略
+  }
+  return next;
 }

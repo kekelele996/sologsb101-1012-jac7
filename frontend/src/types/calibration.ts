@@ -3,11 +3,18 @@ export type ResponseVerdict = '合格' | '不合格' | '待判定';
 
 export const RESPONSE_VERDICTS: ResponseVerdict[] = ['合格', '不合格', '待判定'];
 
+/** 生效结论：在原响应结论基础上，叠加标准器有效性判定 */
+export type EffectiveVerdict = ResponseVerdict | '依据失效';
+
+export const EFFECTIVE_VERDICTS: EffectiveVerdict[] = ['合格', '不合格', '待判定', '依据失效'];
+
 /** 标定：同一仪器可叠加多次标定记录 */
 export interface Calibration {
   id: string;
   /** 被标定仪器 */
   instrumentId: string;
+  /** 标定时比对的标准器（计量站台账），未挂为 null */
+  standardId: string | null;
   /** 标定日期 */
   date: string;
   /** 灵敏度（V·s/m） */
@@ -48,9 +55,7 @@ export function judgeCalibration(
   if (sensitivity < range.min || sensitivity > range.max) return '不合格';
   if (selfNoise > SELF_NOISE_LIMIT) return '不合格';
   return '合格';
-}
-
-/** 灵敏度变化量（相对上一次标定），返回绝对值与百分比 */
+}/** 灵敏度变化量（相对上一次标定），返回绝对值与百分比 */
 export interface SensitivityDelta {
   /** 本次 - 上次 */
   absolute: number;
@@ -71,13 +76,11 @@ export function sensitivityDelta(current: number, previous: number | null): Sens
 /** 标定页筛选条件（存于 calibrationSlice） */
 export interface CalibrationFilterState {
   keyword: string;
-  verdicts: ResponseVerdict[];
+  verdicts: EffectiveVerdict[];
   instrumentTypes: string[];
   /** 是否只看超期未标定仪器 */
   onlyOverdue: boolean;
-}
-
-export function createEmptyCalibrationFilter(): CalibrationFilterState {
+}export function createEmptyCalibrationFilter(): CalibrationFilterState {
   return {
     keyword: '',
     verdicts: [],

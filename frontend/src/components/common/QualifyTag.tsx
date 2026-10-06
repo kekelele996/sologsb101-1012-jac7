@@ -3,11 +3,11 @@
  * 被台站仪器页（/stations/:id/instruments）与标定记录台（/calibrations）消费。
  */
 import { Tag, Tooltip } from 'antd';
-import { CheckCircleFilled, CloseCircleFilled, QuestionCircleFilled } from '@ant-design/icons';
-import type { ResponseVerdict } from '@/types/calibration';
+import { CheckCircleFilled, CloseCircleFilled, QuestionCircleFilled, WarningFilled } from '@ant-design/icons';
+import type { EffectiveVerdict } from '@/types/calibration';
 
 export interface QualifyTagProps {
-  verdict: ResponseVerdict;
+  verdict: EffectiveVerdict;
   /** 灵敏度值，传入后一并展示 */
   sensitivity?: number;
   /** 自噪值，传入后一并展示 */
@@ -17,7 +17,7 @@ export interface QualifyTagProps {
   plain?: boolean;
 }
 
-const TONE: Record<ResponseVerdict, { color: string; background: string; border: string; icon: JSX.Element }> = {
+const TONE: Record<EffectiveVerdict, { color: string; background: string; border: string; icon: JSX.Element }> = {
   合格: {
     color: '#1e8449',
     background: '#eaf6ee',
@@ -35,6 +35,12 @@ const TONE: Record<ResponseVerdict, { color: string; background: string; border:
     background: '#f2f2f2',
     border: '#bdbdbd',
     icon: <QuestionCircleFilled />,
+  },
+  依据失效: {
+    color: '#b7791f',
+    background: '#fef5e7',
+    border: '#b7791f',
+    icon: <WarningFilled />,
   },
 };
 

@@ -46,7 +46,7 @@ import {
   updateArray,
 } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
-import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectCalibrations, selectEffectiveVerdicts, selectReplaces } from '@/stores/calibrationSlice';
 import { APERTURE_BUCKETS, ARRAY_STATES, type ArrayState, type SeisArray } from '@/types/array';
 import { apertureKm, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
@@ -70,6 +70,7 @@ export default function ArrayList() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const effectiveVerdicts = useAppSelector(selectEffectiveVerdicts);
   const filter = useAppSelector(selectArrayFilter);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
 
@@ -133,7 +134,7 @@ export default function ArrayList() {
           instrumentIds.has(calibration.instrumentId)
         );
         const unqualified = arrayCalibrations.filter(
-          (calibration) => calibration.responseVerdict === '不合格'
+          (calibration) => effectiveVerdicts.get(calibration.id)?.verdict === '不合格'
         ).length;
         const pendingReplace = replaces.filter(
           (replace) => instrumentIds.has(replace.instrumentId) && replace.state !== '已复核'

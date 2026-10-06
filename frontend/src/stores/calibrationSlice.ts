@@ -1,9 +1,10 @@
 /**
  * 标定 slice：维护标定记录、筛选条件与灵敏度派生值；
  * 同时维护更换记录（合格评定与更换提醒同属标定成果的下游动作）。
+ * 生效结论另算：标准器台账由计量站维护，本 slice 按标定日期挂接标准器并算生效值。
  */
-import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
-import { db, createId, watchTable } from '@/utils/db';
+import { createAsyncThunk, createSelector, createSlice, type PayloadAction } from '@reduxjs/toolkit';
+import { db, createId, watchTable, bumpEffectiveVersion } from '@/utils/db';
 import type {
   Calibration,
   CalibrationFilterState,
@@ -13,6 +14,11 @@ import { createEmptyCalibrationFilter, judgeCalibration, sensitivityDelta } from
 import type { Replace, ReplaceFilterState, ReplaceState } from '@/types/replace';
 import { canTransition, createEmptyReplaceFilter } from '@/types/replace';
 import type { Instrument } from '@/types/instrument';
+import {
+  backfillStandardId,
+  computeEffectiveVerdict,
+  type EffectiveVerdictInfo,
+} from '@/types/standard';
 import type { RootState } from '@/stores/store';
 
 /** 选择器入参统一用 RootState */
@@ -28,6 +34,12 @@ export interface CalibrationSliceState {
   replaceFilter: ReplaceFilterState;
   /** 最近一次操作回执 */
   lastReceipt: string;
+  /** 生效结论版本号（台网中心重算口径的版本） */
+  effectiveVersion: number;
+  /** 最近一次重算回执 */
+  recomputeReceipt: string;
+  /** 最近一次重算失败的标定 id 列表（可单条重试） */
+  failedCalibrationIds: string[];
 }
 
 const initialState: CalibrationSliceState = {
@@ -39,6 +51,9 @@ const initialState: CalibrationSliceState = {
   filter: createEmptyCalibrationFilter(),
   replaceFilter: createEmptyReplaceFilter(),
   lastReceipt: '',
+  effectiveVersion: 1,
+  recomputeReceipt: '',
+  failedCalibrationIds: [],
 };
 
 export const createCalibration = createAsyncThunk(
@@ -92,6 +107,64 @@ export const removeCalibration = createAsyncThunk(
   async (calibrationId: string) => {
     await db.calibrations.delete(calibrationId);
     return calibrationId;
+  }
+);
+
+/**
+ * 重算生效结论（台网中心口径）：
+ * 遍历全部标定记录，对未挂标准器的按标定日期回填；逐条处理并捕获失败。
+ * 标准器台账（计量站管辖）只读不改。返回处理结果与新版本号。
+ */
+export const recomputeEffectiveVerdicts = createAsyncThunk(
+  'calibration/recomputeEffectiveVerdicts',
+  async (_, { getState }) => {
+    const state = getState() as RootState;
+    const calibrations = state.calibration.calibrations;
+    const standards = state.standard.standards;
+    const now = Date.now();
+    let relinked = 0;
+    const failed: Array<{ id: string; reason: string }> = [];
+    for (const cal of calibrations) {
+      try {
+        if (!cal.standardId) {
+          const linked = backfillStandardId(cal, standards);
+          if (linked) {
+            await db.calibrations.update(cal.id, { standardId: linked, updatedAt: now } as never);
+            relinked += 1;
+          }
+        }
+      } catch (error) {
+        failed.push({ id: cal.id, reason: error instanceof Error ? error.message : '未知错误' });
+      }
+    }
+    const version = bumpEffectiveVersion();
+    return { processed: calibrations.length, relinked, failed, version };
+  }
+);
+
+/**
+ * 重试单条标定的生效结论（台网中心重出失败后只重试这一份）：
+ * 仅回填该条的标准器挂接，不动标准器台账。
+ */
+export const retryEffectiveVerdict = createAsyncThunk(
+  'calibration/retryEffectiveVerdict',
+  async (calibrationId: string, { getState }) => {
+    const state = getState() as RootState;
+    const calibration = state.calibration.calibrations.find((row) => row.id === calibrationId);
+    if (!calibration) return { id: calibrationId, ok: false, reason: '标定记录不存在' };
+    const standards = state.standard.standards;
+    const now = Date.now();
+    try {
+      if (!calibration.standardId) {
+        const linked = backfillStandardId(calibration, standards);
+        if (linked) {
+          await db.calibrations.update(calibrationId, { standardId: linked, updatedAt: now } as never);
+        }
+      }
+      return { id: calibrationId, ok: true };
+    } catch (error) {
+      return { id: calibrationId, ok: false, reason: error instanceof Error ? error.message : '未知错误' };
+    }
   }
 );
 
@@ -216,6 +289,19 @@ const calibrationSlice = createSlice({
       })
       .addCase(transitionReplace.rejected, (state, action) => {
         state.error = typeof action.payload === 'string' ? action.payload : '更换状态流转失败';
+      })
+      .addCase(recomputeEffectiveVerdicts.fulfilled, (state, action) => {
+        const { processed, relinked, failed, version } = action.payload;
+        state.effectiveVersion = version;
+        state.failedCalibrationIds = failed.map((item) => item.id);
+        state.recomputeReceipt = `已重算 ${processed} 条标定的生效结论，回填标准器 ${relinked} 条` +
+          (failed.length > 0 ? `，失败 ${failed.length} 条（可单条重试）` : '，全部成功');
+      })
+      .addCase(retryEffectiveVerdict.fulfilled, (state, action) => {
+        state.failedCalibrationIds = state.failedCalibrationIds.filter((id) => id !== action.payload.id);
+        state.recomputeReceipt = action.payload.ok
+          ? `标定 ${action.payload.id} 生效结论已重出`
+          : `标定 ${action.payload.id} 重出失败：${action.payload.reason}`;
       });
   },
 });
@@ -273,6 +359,44 @@ export const selectCalibrationsOfInstrument = (
     .filter((row) => row.instrumentId === instrumentId)
     .sort((a, b) => b.date.localeCompare(a.date));
 };
+
+/** 标定 id → 生效结论信息（含依据与标准器有效性），由标准器台账与标定记录实时派生 */
+export const selectEffectiveVerdicts = createSelector(
+  [
+    (state: WithCalibration) => state.calibration.calibrations,
+    (state: WithCalibration) => state.standard.standards,
+  ],
+  (calibrations, standards): Map<string, EffectiveVerdictInfo> => {
+    const standardMap = new Map(standards.map((standard) => [standard.id, standard]));
+    const result = new Map<string, EffectiveVerdictInfo>();
+    calibrations.forEach((calibration) => {
+      const standard = calibration.standardId ? standardMap.get(calibration.standardId) : null;
+      result.set(calibration.id, computeEffectiveVerdict(calibration, standard));
+    });
+    return result;
+  }
+);
+
+/** 单条标定的生效结论信息 */
+export const selectEffectiveVerdictOfCalibration = (
+  state: WithCalibration,
+  calibrationId: string | null | undefined
+): EffectiveVerdictInfo | null => {
+  if (!calibrationId) return null;
+  return selectEffectiveVerdicts(state).get(calibrationId) ?? null;
+};
+
+/** 生效结论版本号 */
+export const selectEffectiveVersion = (state: WithCalibration): number =>
+  state.calibration.effectiveVersion;
+
+/** 最近一次重算回执 */
+export const selectRecomputeReceipt = (state: WithCalibration): string =>
+  state.calibration.recomputeReceipt;
+
+/** 最近一次重算失败的标定 id 列表 */
+export const selectFailedCalibrationIds = (state: WithCalibration): string[] =>
+  state.calibration.failedCalibrationIds;
 
 export const selectReplacesOfInstrument = (
   state: WithCalibration,

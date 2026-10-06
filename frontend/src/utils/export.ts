@@ -11,23 +11,28 @@ import {
   stampBackupTime,
   type BackupPayload,
 } from '@/utils/db';
-import type { ResponseVerdict } from '@/types/calibration';
+import type { Calibration, EffectiveVerdict, ResponseVerdict } from '@/types/calibration';
+import {
+  computeEffectiveVerdict,
+  type Standard,
+} from '@/types/standard';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces', 'standards'] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, standards] = await Promise.all([
     db.arrays.toArray(),
     db.stations.toArray(),
     db.instruments.toArray(),
     db.calibrations.toArray(),
     db.replaces.toArray(),
+    db.standards.toArray(),
   ]);
   return {
     app: 'gbseisarray',
@@ -38,6 +43,7 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     instruments,
     calibrations,
     replaces,
+    standards,
   };
 }
 
@@ -68,6 +74,7 @@ export function validateBackup(input: unknown): {
     instruments: obj.instruments ?? [],
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
+    standards: obj.standards ?? [],
   };
   return { ok: true, errors, payload };
 }
@@ -80,6 +87,7 @@ export function countPayload(payload: BackupPayload): CountMap {
     instruments: payload.instruments.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
+    standards: payload.standards.length,
   };
 }
 
@@ -117,13 +125,14 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.standards],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
+      await db.standards.bulkPut(payload.standards);
     }
   );
   return countPayload(payload);
@@ -160,7 +169,11 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  const standards = payload.standards.map((row) => ({
+    ...row,
+    id: createId('std'),
+  }));
+  return { ...payload, arrays, stations, instruments, calibrations, replaces, standards };
 }
 
 /** 按台阵汇总的几何与标定结论 */
@@ -219,9 +232,15 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
         ? 0
         : round(distances.reduce((sum, row) => sum + row.km, 0) / distances.length, 3);
 
-    const unqualifiedCount = calibrations.filter(
-      (calibration) => calibration.responseVerdict === '不合格'
-    ).length;
+    const standardMap = new Map(payload.standards.map((standard) => [standard.id, standard]));
+    const unqualifiedCount = calibrations.filter((calibration) => {
+      const standard = calibration.standardId ? standardMap.get(calibration.standardId) : null;
+      return computeEffectiveVerdict(calibration, standard).verdict === '不合格';
+    }).length;
+    const invalidBasisCount = calibrations.filter((calibration) => {
+      const standard = calibration.standardId ? standardMap.get(calibration.standardId) : null;
+      return computeEffectiveVerdict(calibration, standard).verdict === '依据失效';
+    }).length;
     const overdueCount = instruments.filter((instrument) => {
       const rows = calibrations
         .filter((calibration) => calibration.instrumentId === instrument.id)
@@ -239,6 +258,7 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
       `累计 ${calibrations.length} 次标定`,
     ];
     if (unqualifiedCount > 0) conclusionParts.push(`${unqualifiedCount} 次标定不合格`);
+    if (invalidBasisCount > 0) conclusionParts.push(`${invalidBasisCount} 次依据失效`);
     if (overdueCount > 0) conclusionParts.push(`${overdueCount} 台超期未标定`);
     if (pendingReplaceCount > 0) conclusionParts.push(`${pendingReplaceCount} 条更换未闭环`);
 
@@ -272,7 +292,7 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
   });
 }
 
-/** 判定结论统计 */
+/** 生效结论统计 */
 export function verdictCounts(calibrations: Array<{ responseVerdict: ResponseVerdict }>): Record<
   ResponseVerdict,
   number
@@ -280,6 +300,21 @@ export function verdictCounts(calibrations: Array<{ responseVerdict: ResponseVer
   const counts: Record<ResponseVerdict, number> = { 合格: 0, 不合格: 0, 待判定: 0 };
   calibrations.forEach((calibration) => {
     counts[calibration.responseVerdict] += 1;
+  });
+  return counts;
+}
+
+/** 生效结论统计（含依据失效） */
+export function effectiveVerdictCounts(
+  calibrations: Calibration[],
+  standards: Standard[]
+): Record<EffectiveVerdict, number> {
+  const standardMap = new Map(standards.map((s) => [s.id, s]));
+  const counts: Record<EffectiveVerdict, number> = { 合格: 0, 不合格: 0, 待判定: 0, 依据失效: 0 };
+  calibrations.forEach((calibration) => {
+    const standard = calibration.standardId ? standardMap.get(calibration.standardId) : null;
+    const effective = computeEffectiveVerdict(calibration, standard);
+    counts[effective.verdict] += 1;
   });
   return counts;
 }
